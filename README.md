@@ -14,8 +14,12 @@ written to one output xlsx per department.
 - **Grouping:** department only; the sensitive category and source file are
   recorded as columns, so a URL flagged by multiple sensitive files yields one
   row per category.
-- **Extraction:** every cell on every sheet (and hyperlink targets) is scanned
-  with a SharePoint URL regex, so column layout / headers don't matter.
+- **Extraction:** the URL is read from a named column. The check-list column
+  defaults to `ObjectId`; the sensitive-file column defaults to `FileUrl`.
+  Change the `CHECKLIST_COLUMN` / `SENSITIVE_COLUMN` constants at the top of
+  `match.py`, or override per run with `--checklist-column` /
+  `--sensitive-column`. Header matching is case-insensitive and
+  whitespace-trimmed; all worksheets in a workbook are searched for the column.
 
 ## Setup
 
@@ -33,7 +37,17 @@ python3 -m venv .venv
     --out-dir       /path/to/output
 ```
 
+Override the URL columns if your files differ from the defaults:
+
+```bash
+./.venv/bin/python match.py ... \
+    --checklist-column ObjectId \
+    --sensitive-column FileUrl
+```
+
 Optional `--glob` overrides the sensitive-file pattern (default `*.xlsx`).
+A sensitive file missing the column is skipped (with the headers it has
+listed); the check-list missing its column is a hard error.
 
 Output: `<out-dir>/<department>.xlsx`, columns `SharePoint URL`,
 `Sensitive Category`, `Source File`. URLs with no `/sites/` or `/teams/`
