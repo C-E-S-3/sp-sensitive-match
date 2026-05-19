@@ -19,12 +19,19 @@ written to one output xlsx per department.
   CSV delimiter is auto-detected (comma/semicolon/tab/pipe) and a BOM is
   tolerated. To scan CSV sensitive files pass `--glob "*.csv"`. Output
   per-department files are always `.xlsx`.
-- **Extraction:** the URL is read from a named column. The check-list column
-  defaults to `ObjectId`; the sensitive-file column defaults to `FileUrl`.
-  Change the `CHECKLIST_COLUMN` / `SENSITIVE_COLUMN` constants at the top of
-  `match.py`, or override per run with `--checklist-column` /
-  `--sensitive-column`. Header matching is case-insensitive and
-  whitespace-trimmed; all worksheets in a workbook are searched for the column.
+- **Extraction:** the URL is read from a named column **verbatim** (URLs may
+  contain spaces, e.g. `Shared Documents`, so the full cell value is kept).
+  The check-list column defaults to `ObjectId`; the sensitive-file URL column
+  to `FileUrl`. A second sensitive-file column (default `LastModifiedTime`) is
+  carried into the output. Change the `CHECKLIST_COLUMN` / `SENSITIVE_COLUMN`
+  / `SENSITIVE_EXTRA_COLUMN` constants at the top of `match.py`, or override
+  per run with `--checklist-column` / `--sensitive-column` /
+  `--sensitive-extra-column`. Header matching is case-insensitive and
+  whitespace-trimmed; all worksheets in a workbook are searched. A missing
+  extra column is tolerated (blank cell + warning); a missing URL column
+  skips that sensitive file (or hard-errors for the check-list).
+- **Output columns:** `<sensitive-column>`, `<sensitive-extra-column>`,
+  `Sensitive Category`, `Source File` — one `.xlsx` per department.
 
 ## Setup
 

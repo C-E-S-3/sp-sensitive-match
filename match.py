@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
 Compare a check-list of SharePoint URLs against a directory of "sensitive data"
-xlsx files. For every URL in the check-list that also appears in a sensitive
-file, group the match by department (the path segment after /sites/) and write
-one output xlsx per department.
+files (.xlsx or .csv). For every URL in the check-list that also appears in a
+sensitive file, group the match by department (the path segment after /sites/)
+and write one output .xlsx per department.
 
 Match basis : exact full URL (whitespace-trimmed, case-insensitive).
 Grouping    : department only (category is recorded as a column).
 
-Column names (the columns that hold the SharePoint URL) default to the
-constants below and can be overridden per run with --checklist-column /
---sensitive-column. Header matching is case-insensitive and whitespace-trimmed.
+Column names default to the constants below and can be overridden per run:
+  --checklist-column        URL column in the check-list      (ObjectId)
+  --sensitive-column        URL column in the sensitive files (FileUrl)
+  --sensitive-extra-column  extra column carried to output    (LastModifiedTime)
+
+Header matching is case-insensitive and whitespace-trimmed.
 
 Usage:
     python match.py \
         --sensitive-dir ./sensitive \
         --checklist     ./checklist.xlsx \
-        --out-dir       ./output
+        --out-dir       ./output \
+        --glob "*.csv"
 """
 
 import argparse
@@ -28,21 +32,18 @@ from pathlib import Path
 
 import openpyxl
 
-# csv default field-size limit is too small for long SharePoint URLs in
-# pathological rows; raise it.
+# csv default field-size limit is too small for very long rows; raise it.
 csv.field_size_limit(10 * 1024 * 1024)
 
 # ---------------------------------------------------------------------------
-# Column names that hold the SharePoint URL. Change here, or override per run
-# with --checklist-column / --sensitive-column.
+# Column names. Change here, or override per run with the matching CLI flags.
 # ---------------------------------------------------------------------------
-CHECKLIST_COLUMN = "ObjectId"   # the file listing the URLs to confirm
-SENSITIVE_COLUMN = "FileUrl"    # the scanned secrets/addresses/... files
+CHECKLIST_COLUMN = "ObjectId"          # the file listing the URLs to confirm
+SENSITIVE_COLUMN = "FileUrl"           # URL column in the scanned files
+SENSITIVE_EXTRA_COLUMN = "LastModifiedTime"  # extra column carried to output
 # ---------------------------------------------------------------------------
 
-# Pulls the URL out of a cell that may also contain surrounding text.
-URL_RE = re.compile(r"https?://[^\s\"'<>]*sharepoint\.com[^\s\"'<>]*", re.IGNORECASE)
-# Department = first path segment after /sites/ (or /teams/ for MS Teams sites).
+# Department = first path segment after /sites/ (or /teams/ for Teams sites).
 DEPT_RE = re.compile(r"/(?:sites|teams)/([^/?#]+)", re.IGNORECASE)
 
 
@@ -60,28 +61,17 @@ def safe_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "_unnamed"
 
 
-def _extract_url(raw):
-    """Normalize a raw cell/field value to a URL string (or None).
-    If the text wraps a URL in other text, extract just the URL."""
-    if raw is None:
+def _clean(value):
+    """Cell/field value -> trimmed string, or None if blank. The full value is
+    kept as-is (URLs may legitimately contain spaces, e.g. 'Shared Documents')."""
+    if value is None:
         return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    m = URL_RE.search(text)
-    return m.group(0) if m else text
+    text = str(value).strip()
+    return text or None
 
 
-def _cell_url(cell):
-    """openpyxl cell -> URL: value, falling back to a hyperlink target."""
-    raw = cell.value
-    if raw is None or str(raw).strip() == "":
-        raw = getattr(cell.hyperlink, "target", None)
-    return _extract_url(raw)
-
-
-def _iter_xlsx(path: Path, want: str, seen_headers: set):
-    """Yield URLs from the named column across all worksheets of an xlsx."""
+def _xlsx_rows(path: Path):
+    """Yield (header_list, data_row_iter) for each non-empty worksheet."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
         for ws in wb.worksheets:
@@ -89,103 +79,133 @@ def _iter_xlsx(path: Path, want: str, seen_headers: set):
             try:
                 header = next(rows)
             except StopIteration:
-                continue  # empty sheet
-            col_idx = None
-            for i, hcell in enumerate(header):
-                hv = hcell.value
-                if hv is None:
-                    continue
-                seen_headers.add(str(hv).strip())
-                if str(hv).strip().lower() == want:
-                    col_idx = i
-                    break
-            if col_idx is None:
                 continue
-            for row in rows:
-                if col_idx < len(row):
-                    url = _cell_url(row[col_idx])
-                    if url:
-                        yield url
+            yield [h.value for h in header], (
+                # carry both value and hyperlink target per cell; read-only
+                # cells expose no .hyperlink, so getattr-guard it
+                [(c.value, getattr(getattr(c, "hyperlink", None), "target", None))
+                 for c in r]
+                for r in rows
+            )
     finally:
         wb.close()
 
 
-def _iter_csv(path: Path, want: str, seen_headers: set):
-    """Yield URLs from the named column of a CSV. Delimiter is sniffed
-    (comma/semicolon/tab/pipe); a BOM is tolerated."""
+def _csv_rows(path: Path):
+    """Yield (header_list, data_row_iter) for a CSV (single logical sheet)."""
     with open(path, newline="", encoding="utf-8-sig") as fh:
         sample = fh.read(8192)
         fh.seek(0)
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
         except csv.Error:
-            dialect = csv.excel  # default to comma
+            dialect = csv.excel
         reader = csv.reader(fh, dialect)
         try:
             header = next(reader)
         except StopIteration:
-            return  # empty file
-        col_idx = None
-        for i, h in enumerate(header):
-            if h is None:
-                continue
-            seen_headers.add(str(h).strip())
-            if str(h).strip().lower() == want:
-                col_idx = i
-                break
-        if col_idx is None:
             return
-        for row in reader:
-            if col_idx < len(row):
-                url = _extract_url(row[col_idx])
-                if url:
-                    yield url
+        # materialize: file closes when this function returns
+        yield header, ([(v, None) for v in row] for row in reader)
 
 
-def iter_urls(path: Path, column: str):
-    """Yield every URL found in the named column of an xlsx or csv file.
+def read_records(path: Path, wanted: dict):
+    """Yield dicts keyed by the logical names in `wanted` (name -> header).
 
-    Header matching is case-insensitive and whitespace-trimmed. Raises
-    ValueError if the column is not present (xlsx: in any worksheet).
+    For .xlsx every worksheet is searched. After iterating, the columns that
+    were located are exposed on `read_records.found_names` and all headers
+    seen on `read_records.last_headers`. Raises ValueError for an unsupported
+    extension; missing columns simply yield None for that key.
     """
-    want = column.strip().lower()
-    seen_headers: set = set()
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        reader = _iter_csv(path, want, seen_headers)
+        sheets = _csv_rows(path)
     elif suffix in (".xlsx", ".xlsm"):
-        reader = _iter_xlsx(path, want, seen_headers)
+        sheets = _xlsx_rows(path)
     else:
         raise ValueError(
             f"{path.name}: unsupported extension '{path.suffix}' "
             f"(expected .csv, .xlsx, or .xlsm)"
         )
 
-    yielded = False
-    for url in reader:
-        yielded = True
-        yield url
+    want_lc = {name: hdr.strip().lower() for name, hdr in wanted.items()}
+    read_records.last_headers = set()
+    read_records.found_names = set()
 
-    if not yielded and want not in {h.strip().lower() for h in seen_headers}:
+    for header, data_rows in sheets:
+        idx = {}
+        for i, h in enumerate(header):
+            if h is None:
+                continue
+            hs = str(h).strip()
+            read_records.last_headers.add(hs)
+            for name, target in want_lc.items():
+                if hs.lower() == target:
+                    idx[name] = i
+        if not idx:
+            continue
+        read_records.found_names |= set(idx)
+        for cells in data_rows:
+            rec = {}
+            for name, i in idx.items():
+                if i < len(cells):
+                    val, link = cells[i]
+                    rec[name] = _clean(val) or _clean(link)
+                else:
+                    rec[name] = None
+            yield rec
+
+
+def iter_checklist_urls(path: Path, column: str):
+    """Yield every URL in the check-list's URL column. Raises ValueError if
+    the column is absent."""
+    got = False
+    for rec in read_records(path, {"url": column}):
+        got = True
+        if rec.get("url"):
+            yield rec["url"]
+    if not got and "url" not in read_records.found_names:
         raise ValueError(
             f"{path.name}: no column named '{column}'. "
-            f"Headers seen: {sorted(seen_headers) or '(none)'}"
+            f"Headers seen: {sorted(read_records.last_headers) or '(none)'}"
         )
+
+
+def iter_sensitive_records(path: Path, url_col: str, extra_col: str):
+    """Yield (url, extra_value) from a sensitive file. Raises ValueError if the
+    URL column is absent (whole file unusable). A missing extra column is
+    tolerated: extra_value is None and `.extra_missing` is set True."""
+    iter_sensitive_records.extra_missing = False
+    saw_any = False
+    for rec in read_records(path, {"url": url_col, "extra": extra_col}):
+        saw_any = True
+        if rec.get("url"):
+            yield rec["url"], rec.get("extra")
+    if "url" not in read_records.found_names and not saw_any:
+        raise ValueError(
+            f"{path.name}: no column named '{url_col}'. "
+            f"Headers seen: {sorted(read_records.last_headers) or '(none)'}"
+        )
+    if "extra" not in read_records.found_names:
+        iter_sensitive_records.extra_missing = True
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--sensitive-dir", required=True, type=Path,
-                   help="Directory of sensitive xlsx files (secrets.xlsx, ...)")
+                   help="Directory of sensitive files (secrets.csv, ...)")
     p.add_argument("--checklist", required=True, type=Path,
-                   help="Single xlsx with the URLs to confirm")
+                   help="Single file with the URLs to confirm")
     p.add_argument("--out-dir", required=True, type=Path,
-                   help="Where per-department xlsx files are written")
+                   help="Where per-department .xlsx files are written")
     p.add_argument("--checklist-column", default=CHECKLIST_COLUMN,
                    help=f"URL column in the check-list (default: {CHECKLIST_COLUMN})")
     p.add_argument("--sensitive-column", default=SENSITIVE_COLUMN,
                    help=f"URL column in the sensitive files (default: {SENSITIVE_COLUMN})")
+    p.add_argument("--sensitive-extra-column", default=SENSITIVE_EXTRA_COLUMN,
+                   help="Extra column from the sensitive files carried into "
+                        f"the output (default: {SENSITIVE_EXTRA_COLUMN})")
     p.add_argument("--glob", default="*.xlsx",
                    help="Filename pattern for sensitive files (default: *.xlsx)")
     args = p.parse_args()
@@ -195,10 +215,10 @@ def main() -> int:
     if not args.checklist.is_file():
         p.error(f"--checklist not found: {args.checklist}")
 
-    # 1. Build the check-list lookup: normalized URL -> original URL (first seen).
+    # 1. Build the check-list lookup: normalized URL -> original URL.
     try:
         checklist = {}
-        for url in iter_urls(args.checklist, args.checklist_column):
+        for url in iter_checklist_urls(args.checklist, args.checklist_column):
             checklist.setdefault(normalize(url), url)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -217,25 +237,27 @@ def main() -> int:
         return 1
 
     # 2. Scan each sensitive file; collect matches grouped by department.
-    #    dept -> set of (display_url, category, source_file)  [set = dedup]
+    #    dept -> set of (url, extra, category, source_file)  [set = dedup]
     by_dept = defaultdict(set)
     print(f"scanning {len(sensitive_files)} sensitive file(s) "
-          f"(column '{args.sensitive_column}'):")
+          f"(url='{args.sensitive_column}', extra='{args.sensitive_extra_column}'):")
     for sf in sensitive_files:
-        category = sf.stem               # secrets, addresses, creditcard, ...
+        category = sf.stem
         matched_here = 0
         try:
-            for url in iter_urls(sf, args.sensitive_column):
+            for url, extra in iter_sensitive_records(
+                    sf, args.sensitive_column, args.sensitive_extra_column):
                 key = normalize(url)
                 if key in checklist:
-                    display = checklist[key]  # use the check-list's form
-                    by_dept[department_of(display)].add(
-                        (display, category, sf.name))
+                    by_dept[department_of(url)].add(
+                        (url, extra or "", category, sf.name))
                     matched_here += 1
             note = f"matches={matched_here}"
+            if iter_sensitive_records.extra_missing:
+                note += f"  [warn: no '{args.sensitive_extra_column}' column]"
         except ValueError as e:
             note = f"SKIPPED ({e})"
-        print(f"  {sf.name:<30} category={category:<15} {note}")
+        print(f"  {sf.name:<28} category={category:<14} {note}")
 
     if not by_dept:
         print("\nNo matches found. No output files written.")
@@ -246,18 +268,19 @@ def main() -> int:
     print()
     grand_total = 0
     for dept in sorted(by_dept):
-        rows = sorted(by_dept[dept], key=lambda r: (r[1], r[0]))
+        rows = sorted(by_dept[dept], key=lambda r: (r[2], r[0]))
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = safe_filename(dept)[:31] or "Sheet1"
-        ws.append(["SharePoint URL", "Sensitive Category", "Source File"])
-        for url, category, src in rows:
-            ws.append([url, category, src])
+        ws.append([args.sensitive_column, args.sensitive_extra_column,
+                   "Sensitive Category", "Source File"])
+        for url, extra, category, src in rows:
+            ws.append([url, extra, category, src])
         ws.freeze_panes = "A2"
         out_path = args.out_dir / f"{safe_filename(dept)}.xlsx"
         wb.save(out_path)
         grand_total += len(rows)
-        print(f"  {out_path.name:<30} {len(rows)} matched URL(s)")
+        print(f"  {out_path.name:<28} {len(rows)} matched URL(s)")
 
     print(f"\nDone: {grand_total} match row(s) across "
           f"{len(by_dept)} department file(s) in {args.out_dir}")
