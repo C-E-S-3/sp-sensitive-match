@@ -14,6 +14,11 @@ written to one output xlsx per department.
 - **Grouping:** department only; the sensitive category and source file are
   recorded as columns, so a URL flagged by multiple sensitive files yields one
   row per category.
+- **Input formats:** `.xlsx`/`.xlsm` and `.csv` are both supported, for the
+  check-list and the sensitive files independently (dispatched by extension).
+  CSV delimiter is auto-detected (comma/semicolon/tab/pipe) and a BOM is
+  tolerated. To scan CSV sensitive files pass `--glob "*.csv"`. Output
+  per-department files are always `.xlsx`.
 - **Extraction:** the URL is read from a named column. The check-list column
   defaults to `ObjectId`; the sensitive-file column defaults to `FileUrl`.
   Change the `CHECKLIST_COLUMN` / `SENSITIVE_COLUMN` constants at the top of

@@ -20,12 +20,17 @@ Usage:
 """
 
 import argparse
+import csv
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import openpyxl
+
+# csv default field-size limit is too small for long SharePoint URLs in
+# pathological rows; raise it.
+csv.field_size_limit(10 * 1024 * 1024)
 
 # ---------------------------------------------------------------------------
 # Column names that hold the SharePoint URL. Change here, or override per run
@@ -55,30 +60,29 @@ def safe_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "_unnamed"
 
 
-def _cell_url(cell):
-    """Return the URL for a cell: its value, falling back to a hyperlink target.
-    If the text contains a URL embedded in other text, extract just the URL."""
-    raw = cell.value
-    if raw is None or str(raw).strip() == "":
-        raw = getattr(cell.hyperlink, "target", None)
-    if not raw:
+def _extract_url(raw):
+    """Normalize a raw cell/field value to a URL string (or None).
+    If the text wraps a URL in other text, extract just the URL."""
+    if raw is None:
         return None
     text = str(raw).strip()
+    if not text:
+        return None
     m = URL_RE.search(text)
     return m.group(0) if m else text
 
 
-def iter_urls(xlsx_path: Path, column: str):
-    """Yield every URL found in the named column across all worksheets.
+def _cell_url(cell):
+    """openpyxl cell -> URL: value, falling back to a hyperlink target."""
+    raw = cell.value
+    if raw is None or str(raw).strip() == "":
+        raw = getattr(cell.hyperlink, "target", None)
+    return _extract_url(raw)
 
-    The first row of each worksheet is treated as the header. Sheets that do
-    not contain `column` are skipped. Raises ValueError if no worksheet in the
-    workbook has the column.
-    """
-    wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
-    want = column.strip().lower()
-    found_anywhere = False
-    seen_headers = set()
+
+def _iter_xlsx(path: Path, want: str, seen_headers: set):
+    """Yield URLs from the named column across all worksheets of an xlsx."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
         for ws in wb.worksheets:
             rows = ws.iter_rows()
@@ -97,7 +101,6 @@ def iter_urls(xlsx_path: Path, column: str):
                     break
             if col_idx is None:
                 continue
-            found_anywhere = True
             for row in rows:
                 if col_idx < len(row):
                     url = _cell_url(row[col_idx])
@@ -106,9 +109,66 @@ def iter_urls(xlsx_path: Path, column: str):
     finally:
         wb.close()
 
-    if not found_anywhere:
+
+def _iter_csv(path: Path, want: str, seen_headers: set):
+    """Yield URLs from the named column of a CSV. Delimiter is sniffed
+    (comma/semicolon/tab/pipe); a BOM is tolerated."""
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        sample = fh.read(8192)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel  # default to comma
+        reader = csv.reader(fh, dialect)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return  # empty file
+        col_idx = None
+        for i, h in enumerate(header):
+            if h is None:
+                continue
+            seen_headers.add(str(h).strip())
+            if str(h).strip().lower() == want:
+                col_idx = i
+                break
+        if col_idx is None:
+            return
+        for row in reader:
+            if col_idx < len(row):
+                url = _extract_url(row[col_idx])
+                if url:
+                    yield url
+
+
+def iter_urls(path: Path, column: str):
+    """Yield every URL found in the named column of an xlsx or csv file.
+
+    Header matching is case-insensitive and whitespace-trimmed. Raises
+    ValueError if the column is not present (xlsx: in any worksheet).
+    """
+    want = column.strip().lower()
+    seen_headers: set = set()
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        reader = _iter_csv(path, want, seen_headers)
+    elif suffix in (".xlsx", ".xlsm"):
+        reader = _iter_xlsx(path, want, seen_headers)
+    else:
         raise ValueError(
-            f"{xlsx_path.name}: no worksheet has a column named '{column}'. "
+            f"{path.name}: unsupported extension '{path.suffix}' "
+            f"(expected .csv, .xlsx, or .xlsm)"
+        )
+
+    yielded = False
+    for url in reader:
+        yielded = True
+        yield url
+
+    if not yielded and want not in {h.strip().lower() for h in seen_headers}:
+        raise ValueError(
+            f"{path.name}: no column named '{column}'. "
             f"Headers seen: {sorted(seen_headers) or '(none)'}"
         )
 
